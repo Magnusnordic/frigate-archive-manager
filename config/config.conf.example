@@ -1,0 +1,27 @@
+# Frigate Archive Manager v2.0
+#
+# Kopiér denne fil til:
+# /etc/frigate-archive/config.conf
+#
+# Tilpas derefter stierne til dit miljø.
+
+SOURCE="/media/frigate/recordings"
+DEST="/mnt/truenas/frigate_archive/recordings"
+DEST_MOUNT="/mnt/truenas/frigate_archive"
+
+LOG_DIR="/var/log/frigate-archive"
+STATE_DIR="/var/lib/frigate-archive"
+TMP_DIR="/var/cache/frigate-archive"
+
+LOCKFILE="/run/frigate-archive.lock"
+
+VERIFY_COPY=true
+COMPLETE_MARKER=".archive_complete"
+
+# Maksimalt antal historikposter
+HISTORY_LIMIT=365
+
+# Home Assistant-status-API
+API_ENABLED=true
+API_BIND="0.0.0.0"
+API_PORT=8765
