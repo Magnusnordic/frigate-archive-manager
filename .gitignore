@@ -1,0 +1,20 @@
+# Lokal konfiguration
+config.conf
+
+# Runtime-data
+logs/
+state/
+tmp/
+
+# Låsefiler og midlertidige filer
+*.lock
+*.tmp
+
+# Backups
+*.backup
+*.bak
+archive.sh.v*-backup
+
+# Editor-filer
+*.swp
+*~
