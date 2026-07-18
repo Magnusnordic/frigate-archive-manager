@@ -1,0 +1,26 @@
+[
+  {
+    "timestamp": "2026-07-19T01:01:46+02:00",
+    "status": "failed",
+    "last_archived_day": "",
+    "archived_days": 0,
+    "skipped_days": 0,
+    "files": 0,
+    "bytes": 0,
+    "size": "0.00B",
+    "duration_seconds": 0,
+    "error": "Uventet fejl på linje 103, kode 2"
+  },
+  {
+    "timestamp": "2026-07-19T01:01:47+02:00",
+    "status": "success",
+    "last_archived_day": "",
+    "archived_days": 0,
+    "skipped_days": 0,
+    "files": 229,
+    "bytes": 0,
+    "size": "0.00B",
+    "duration_seconds": 1,
+    "error": ""
+  }
+]

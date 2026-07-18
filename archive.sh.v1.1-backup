@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ==========================================================
+# Frigate Archive Manager v1.1
+# Funktioner:
+#   - Arkiverer kun afsluttede dato-mapper
+#   - Forhindrer samtidige kørsler med flock
+#   - Verificerer manglende filer og størrelsesændringer
+#   - Skriver log og JSON-status
+# ==========================================================
+
+VERSION="1.1"
+CONFIG_FILE="/opt/frigate-archive/config.conf"
+
+# ----------------------------------------------------------
+# Indlæs konfiguration
+# ----------------------------------------------------------
+
+if [[ ! -r "$CONFIG_FILE" ]]; then
+    echo "ERROR: Kan ikke læse konfigurationen: $CONFIG_FILE" >&2
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$CONFIG_FILE"
+
+: "${SOURCE:?SOURCE mangler i config.conf}"
+: "${DEST:?DEST mangler i config.conf}"
+: "${LOGFILE:?LOGFILE mangler i config.conf}"
+: "${STATEFILE:?STATEFILE mangler i config.conf}"
+
+LOCKFILE="${LOCKFILE:-/run/frigate-archive.lock}"
+VERIFY_COPY="${VERIFY_COPY:-true}"
+
+mkdir -p "$(dirname "$LOGFILE")"
+mkdir -p "$(dirname "$STATEFILE")"
+mkdir -p "$(dirname "$LOCKFILE")"
+
+# ----------------------------------------------------------
+# Lock
+# ----------------------------------------------------------
+
+exec 9>"$LOCKFILE"
+
+if ! flock -n 9; then
+    echo "[$(date '+%F %T')] En arkivering kører allerede. Afslutter." \
+        | tee -a "$LOGFILE"
+    exit 0
+fi
+
+# ----------------------------------------------------------
+# Variabler
+# ----------------------------------------------------------
+
+START_EPOCH=$(date +%s)
+START_TIME=$(date '+%F %T')
+TODAY=$(date +%F)
+
+CURRENT_DAY=""
+ARCHIVED_DAYS=0
+TOTAL_SOURCE_FILES=0
+STATUS="running"
+ERROR_MESSAGE=""
+
+# ----------------------------------------------------------
+# Funktioner
+# ----------------------------------------------------------
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*" | tee -a "$LOGFILE"
+}
+
+json_escape() {
+    local value="${1:-}"
+
+    value=${value//\\/\\\\}
+    value=${value//\"/\\\"}
+    value=${value//$'\n'/\\n}
+    value=${value//$'\r'/\\r}
+    value=${value//$'\t'/\\t}
+
+    printf '%s' "$value"
+}
+
+write_state() {
+    local end_epoch duration last_success
+    end_epoch=$(date +%s)
+    duration=$((end_epoch - START_EPOCH))
+
+    if [[ "$STATUS" == "success" ]]; then
+        last_success="$(date '+%F %T')"
+    else
+        last_success=""
+    fi
+
+    local temp_state
+    temp_state="${STATEFILE}.tmp"
+
+    cat > "$temp_state" <<EOF
+{
+  "version": "$(json_escape "$VERSION")",
+  "status": "$(json_escape "$STATUS")",
+  "last_run": "$(date '+%F %T')",
+  "last_success": "$(json_escape "$last_success")",
+  "current_day": "$(json_escape "$CURRENT_DAY")",
+  "archived_days": $ARCHIVED_DAYS,
+  "source_files": $TOTAL_SOURCE_FILES,
+  "duration_seconds": $duration,
+  "error": "$(json_escape "$ERROR_MESSAGE")"
+}
+EOF
+
+    mv "$temp_state" "$STATEFILE"
+}
+
+fail() {
+    STATUS="failed"
+    ERROR_MESSAGE="$1"
+
+    log "ERROR: $ERROR_MESSAGE"
+    write_state
+    exit 1
+}
+
+on_unexpected_error() {
+    local exit_code=$?
+    local line_number=$1
+
+    if [[ "$STATUS" != "failed" ]]; then
+        STATUS="failed"
+        ERROR_MESSAGE="Uventet fejl på linje $line_number, exit-kode $exit_code"
+        log "ERROR: $ERROR_MESSAGE"
+        write_state
+    fi
+
+    exit "$exit_code"
+}
+
+trap 'on_unexpected_error $LINENO' ERR
+
+verify_day() {
+    local source_day="$1"
+    local destination_day="$2"
+    local verify_output
+    local verify_file
+
+    verify_file=$(mktemp /opt/frigate-archive/tmp/verify.XXXXXX)
+
+    # Dry-run:
+    # Alt output her betyder, at en kildefil mangler på NAS,
+    # eller at filstørrelsen/tidsstemplet ikke matcher.
+    if ! rsync -rtni \
+        --size-only \
+        --no-owner \
+        --no-group \
+        --no-perms \
+        "$source_day/" \
+        "$destination_day/" > "$verify_file"; then
+
+        rm -f "$verify_file"
+        return 1
+    fi
+
+    verify_output=$(cat "$verify_file")
+    rm -f "$verify_file"
+
+    if [[ -n "$verify_output" ]]; then
+        log "Verificering fandt afvigelser:"
+        printf '%s\n' "$verify_output" | tee -a "$LOGFILE"
+        return 1
+    fi
+
+    return 0
+}
+
+# ----------------------------------------------------------
+# Kontrol før arkivering
+# ----------------------------------------------------------
+
+log "=================================================="
+log "Frigate Archive Manager v$VERSION"
+log "Starter arkivering"
+
+[[ -d "$SOURCE" ]] || fail "Kildemappen findes ikke: $SOURCE"
+
+DEST_MOUNT="/mnt/truenas/frigate_archive"
+
+if ! mountpoint -q "$DEST_MOUNT"; then
+    fail "TrueNAS er ikke monteret på $DEST_MOUNT"
+fi
+
+if ! touch "$DEST_MOUNT/.frigate-archive-write-test"; then
+    fail "Destinationen er monteret, men kan ikke skrives til"
+fi
+
+rm -f "$DEST_MOUNT/.frigate-archive-write-test"
+
+mkdir -p "$DEST"
+
+# ----------------------------------------------------------
+# Arkivering
+# ----------------------------------------------------------
+
+shopt -s nullglob
+
+DAY_DIRECTORIES=("$SOURCE"/*)
+
+for DAY_PATH in "${DAY_DIRECTORIES[@]}"; do
+    [[ -d "$DAY_PATH" ]] || continue
+
+    DAY_NAME=$(basename "$DAY_PATH")
+
+    # Frigate-mapper skal være datoer som 2026-07-18.
+    if [[ ! "$DAY_NAME" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        log "Springer ukendt mappe over: $DAY_NAME"
+        continue
+    fi
+
+    # Dagens optagelser er stadig aktive.
+    if [[ "$DAY_NAME" == "$TODAY" ]]; then
+        log "Springer dagens aktive mappe over: $DAY_NAME"
+        continue
+    fi
+
+    CURRENT_DAY="$DAY_NAME"
+    DESTINATION_DAY="$DEST/$DAY_NAME"
+
+    SOURCE_FILE_COUNT=$(
+        find "$DAY_PATH" -type f -printf '.' | wc -c
+    )
+
+    TOTAL_SOURCE_FILES=$((TOTAL_SOURCE_FILES + SOURCE_FILE_COUNT))
+
+    log "Arkiverer dato: $DAY_NAME"
+    log "Kildefiler: $SOURCE_FILE_COUNT"
+
+    mkdir -p "$DESTINATION_DAY"
+
+    if ! rsync -rt \
+        --ignore-existing \
+        --partial \
+        --no-owner \
+        --no-group \
+        --no-perms \
+        "$DAY_PATH/" \
+        "$DESTINATION_DAY/"; then
+
+        fail "rsync fejlede under arkivering af $DAY_NAME"
+    fi
+
+    if [[ "$VERIFY_COPY" == "true" ]]; then
+        log "Verificerer dato: $DAY_NAME"
+
+        if ! verify_day "$DAY_PATH" "$DESTINATION_DAY"; then
+            fail "Verificering fejlede for $DAY_NAME"
+        fi
+
+        log "Verificering OK: $DAY_NAME"
+    fi
+
+    ARCHIVED_DAYS=$((ARCHIVED_DAYS + 1))
+done
+
+# ----------------------------------------------------------
+# Afslutning
+# ----------------------------------------------------------
+
+CURRENT_DAY=""
+STATUS="success"
+ERROR_MESSAGE=""
+
+write_state
+
+END_EPOCH=$(date +%s)
+DURATION=$((END_EPOCH - START_EPOCH))
+
+log "Arkivering færdig"
+log "Behandlede datoer: $ARCHIVED_DAYS"
+log "Kontrollerede kildefiler: $TOTAL_SOURCE_FILES"
+log "Køretid: ${DURATION} sekunder"
+log "Status: SUCCESS"
+log "=================================================="

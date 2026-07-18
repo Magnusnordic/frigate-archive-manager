@@ -1,0 +1,61 @@
+#!/bin/bash
+set -euo pipefail
+
+# --------------------------------------------------
+# Frigate Archive Manager v1.0
+# --------------------------------------------------
+
+source /opt/frigate-archive/config.conf
+
+# Opret nødvendige mapper
+mkdir -p "$(dirname "$LOGFILE")"
+mkdir -p "$(dirname "$STATEFILE")"
+
+log() {
+    echo "[$(date '+%F %T')] $1" | tee -a "$LOGFILE"
+}
+
+# Kontroller at destinationen er monteret
+if ! mountpoint -q "$(dirname "$DEST")"; then
+    log "ERROR: Destination er ikke monteret: $(dirname "$DEST")"
+    exit 1
+fi
+
+TODAY=$(date +%F)
+
+log "----------------------------------------"
+log "Starter arkivering"
+
+mkdir -p "$DEST"
+
+for DAY in "$SOURCE"/*; do
+
+    [ -d "$DAY" ] || continue
+
+    DAYNAME=$(basename "$DAY")
+
+    # Spring dagens mappe over
+    if [ "$DAYNAME" = "$TODAY" ]; then
+        continue
+    fi
+
+    log "Arkiverer $DAYNAME"
+
+    rsync -a \
+        --ignore-existing \
+        --no-owner \
+        --no-group \
+        --no-perms \
+        "$DAY/" \
+        "$DEST/$DAYNAME/"
+
+done
+
+cat > "$STATEFILE" <<EOF
+{
+  "last_run":"$(date '+%F %T')",
+  "status":"success"
+}
+EOF
+
+log "Arkivering færdig"
